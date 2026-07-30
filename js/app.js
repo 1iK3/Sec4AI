@@ -36,10 +36,17 @@
     handleRoute();
   }
 
+  function isRawMode() {
+    return window.location.pathname.startsWith('/raw/');
+  }
+
   function getPromptIdFromUrl() {
     var path = window.location.pathname;
-    if (path.startsWith('/prompt/')) {
-      return path.replace('/prompt/', '').replace(/\/$/, '').split('?')[0].split('#')[0];
+    var prefixes = ['/raw/', '/prompt/'];
+    for (var i = 0; i < prefixes.length; i++) {
+      if (path.startsWith(prefixes[i])) {
+        return path.replace(prefixes[i], '').replace(/\/$/, '').split('?')[0].split('#')[0];
+      }
     }
     return null;
   }
@@ -49,7 +56,11 @@
     if (id) {
       var prompt = prompts.find(function (p) { return p.id === id; });
       if (prompt) {
-        showDetail(prompt);
+        if (isRawMode()) {
+          showRaw(prompt);
+        } else {
+          showDetail(prompt);
+        }
         return;
       }
     }
@@ -58,7 +69,7 @@
 
   function navigateToPrompt(id) {
     var url = '/prompt/' + id;
-    history.pushState({ promptId: id }, '', url);
+    history.pushState({ promptId: id, raw: false }, '', url);
     handleRoute();
   }
 
@@ -234,7 +245,7 @@
       '<div class="detail-url-section">' +
       '<div class="detail-url-label">' +
       '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>' +
-      'Share this URL for Indirect Injection Testing' +
+      'Indirect Injection Test URL (raw prompt only, no UI)' +
       '</div>' +
       '<div class="url-copy-row">' +
       '<div class="url-display" id="page-url-display"></div>' +
@@ -243,11 +254,15 @@
       'Copy URL' +
       '</button>' +
       '</div>' +
+      '<div style="margin-top:10px;font-size:12px;color:#6e7681;line-height:1.5;">' +
+      'Give this URL to an Agent. When it visits, only the raw prompt text is shown &mdash; no UI, no distractions.' +
+      '</div>' +
       '</div>';
 
+    var rawUrl = window.location.origin + '/raw/' + prompt.id;
     const urlDisplay = document.getElementById('page-url-display');
     if (urlDisplay) {
-      urlDisplay.textContent = window.location.href;
+      urlDisplay.textContent = rawUrl;
     }
 
     document.getElementById('back-to-home').addEventListener('click', function (e) {
@@ -264,7 +279,8 @@
     });
 
     document.getElementById('copy-url-btn').addEventListener('click', function () {
-      copyToClipboard(window.location.href, this);
+      var rawUrl = window.location.origin + '/raw/' + prompt.id;
+      copyToClipboard(rawUrl, this);
       this.textContent = 'Copied!';
       this.classList.add('copied');
       setTimeout(function () {
@@ -312,6 +328,27 @@
       btnEl.textContent = orig;
       btnEl.classList.remove('copied');
     }, 2000);
+  }
+
+  function showRaw(prompt) {
+    document.getElementById('home-view').style.display = 'none';
+    var detailEl = document.getElementById('detail-view');
+    detailEl.style.display = 'block';
+    detailEl.scrollTop = 0;
+    document.title = prompt.title + ' | Sec4AI';
+
+    detailEl.innerHTML =
+      '<div style="max-width:800px;margin:0 auto;padding:40px 24px;">' +
+      '<div style="margin-bottom:16px;font-size:13px;color:#8b949e;">' +
+      'Raw view for indirect injection testing &mdash; ' +
+      '<a href="/prompt/' + prompt.id + '" style="color:#58a6ff;">View details &rarr;</a>' +
+      '</div>' +
+      '<div style="font-family:\'SFMono-Regular\',Consolas,\'Liberation Mono\',Menlo,monospace;font-size:14px;line-height:1.8;color:#e6edf3;white-space:pre-wrap;word-break:break-word;background:#1c2333;border:1px solid #30363d;border-radius:12px;padding:24px;">' +
+      escapeHtml(prompt.prompt) +
+      '</div>' +
+      '</div>';
+
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
   function escapeHtml(str) {

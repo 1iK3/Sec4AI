@@ -4,6 +4,10 @@
     {
       "source": "/prompt/([^/]+)",
       "destination": "/index.html"
+    },
+    {
+      "source": "/raw/([^/]+)",
+      "destination": "/index.html"
     }
   ]
 }
