@@ -1,0 +1,215 @@
+name: Scrape & Sync Prompt Injection Prompts
+
+on:
+  schedule:
+    # Run weekly on Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  scrape-and-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Scrape new prompts from GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > scraper.js << 'SCRIPT'
+          const fs = require('fs');
+          const https = require('https');
+
+          const GITHUB_TOKEN = process.env.GH_TOKEN;
+          const HEADERS = { Authorization: `Bearer ${GITHUB_TOKEN}`, 'User-Agent': 'Sec4AI-Scraper' };
+          const OWN_REPO = '1iK3/Sec4AI';
+
+          function apiGet(path) {
+            return new Promise((resolve, reject) => {
+              https.get(`https://api.github.com${path}`, { headers: HEADERS }, (res) => {
+                let data = '';
+                res.on('data', c => data += c);
+                res.on('end', () => {
+                  try { resolve(JSON.parse(data)); } catch(e) { reject(e); }
+                });
+              }).on('error', reject);
+            });
+          }
+
+          function extractPrompts(text) {
+            const prompts = [];
+            const patterns = [
+              /Ignore\s+(all|any)\s+(previous|above).*?(?:output|print|tell|say).*?(?:system\s+prompt|prompt)/gmis,
+              /Disregard.*?(?:previous|above).*?instructions.*?(?:output|print|tell|say)/gmis,
+              /You\s+are\s+(?:now|going\s+to\s+pretend).*?(?:DAN|Omega|developer\s+mode|unrestricted)/gmis,
+            ];
+            for (const p of patterns) {
+              let m;
+              while ((m = p.exec(text)) !== null) {
+                const candidate = m[0].trim();
+                if (candidate.length > 30 && !prompts.includes(candidate)) {
+                  prompts.push(candidate);
+                }
+              }
+            }
+            return prompts;
+          }
+
+          async function searchRepos() {
+            const queries = [
+              'prompt+injection+in:readme',
+              'prompt+inject+in:name',
+              'jailbreak+prompt+in:name',
+              'prompt+leak+in:name',
+            ];
+            const seen = new Set();
+            const allPrompts = [];
+
+            for (const q of queries) {
+              try {
+                const res = await apiGet(`/search/repositories?q=${q}&sort=stars&order=desc&per_page=15`);
+                for (const repo of res.items || []) {
+                  if (seen.has(repo.full_name)) continue;
+                  seen.add(repo.full_name);
+                  if (repo.full_name === OWN_REPO) continue;
+
+                  // Fetch README
+                  try {
+                    const readme = await apiGet(`/repos/${repo.full_name}/readme`);
+                    const content = Buffer.from(readme.content, 'base64').toString('utf-8');
+                    const found = extractPrompts(content);
+                    for (const p of found) {
+                      allPrompts.push({ prompt: p, source: repo.full_name });
+                    }
+                    console.log(`  ${repo.full_name}: ${found.length} prompts found`);
+                  } catch(e) {
+                    // skip repos without accessible readme
+                  }
+                }
+              } catch(e) {}
+            }
+            return allPrompts;
+          }
+
+          async function main() {
+            console.log('Searching GitHub for prompt injection prompts...');
+            const found = await searchRepos();
+            console.log(`\nFound ${found.length} raw prompt candidates`);
+
+            // Load existing prompts
+            const existing = JSON.parse(fs.readFileSync('data/prompts.json', 'utf8'));
+            const existingIds = new Set(existing.map(p => p.id));
+            const existingPrompts = new Set(existing.map(p => p.prompt.toLowerCase().trim()));
+
+            let added = 0;
+            for (const item of found) {
+              const text = item.prompt.trim();
+              const lower = text.toLowerCase();
+
+              // Deduplicate
+              if (existingPrompts.has(lower)) continue;
+              let isDup = false;
+              for (const ep of existingPrompts) {
+                if (ep.includes(lower) || lower.includes(ep)) { isDup = true; break; }
+              }
+              if (isDup) continue;
+              if (text.length < 30) continue;
+
+              // Generate ID
+              const words = text.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).slice(0, 6);
+              let id = words.join('-');
+
+              // Determine category
+              let category = 'direct-injection';
+              if (/leak/i.test(text)) category = 'prompt-leaking';
+              if (/indirect|hidden|invisible/i.test(text)) category = 'indirect-injection';
+              if (/dan|jailbreak|developer\s*mode|omega/i.test(text)) category = 'jailbreak';
+              if (/base64|hex|rot13|encode|decode|unicode/i.test(text)) category = 'encoding-bypass';
+              if (/translate|language|french|chinese/i.test(text)) category = 'language-bypass';
+
+              // Prevent duplicate IDs
+              let counter = 0;
+              let baseId = id;
+              while (existingIds.has(id)) {
+                counter++;
+                id = baseId + '-' + counter;
+              }
+              existingIds.add(id);
+
+              const entry = {
+                id,
+                title: text.substring(0, 50) + (text.length > 50 ? '...' : ''),
+                category,
+                tags: ['auto-scraped'],
+                brief: text.substring(0, 80) + (text.length > 80 ? '...' : ''),
+                description: `Auto-collected from ${item.source}. Original source: https://github.com/${item.source}`,
+                prompt: text,
+                effect: '自动化采集的注入载荷，具体效果取决于目标模型',
+                scenario: '自动采集 - 来源: ' + item.source
+              };
+              existing.push(entry);
+              added++;
+            }
+
+            fs.writeFileSync('data/prompts.json', JSON.stringify(existing, null, 2), 'utf8');
+            console.log(`Added ${added} new unique prompts (total: ${existing.length})`);
+
+            // Set output for later steps
+            const output = process.env.GITHUB_OUTPUT;
+            if (output) {
+              fs.appendFileSync(output, `prompts_before=${existing.length - added}\n`);
+              fs.appendFileSync(output, `prompts_after=${existing.length}\n`);
+              fs.appendFileSync(output, `prompts_added=${added}\n`);
+            }
+          }
+
+          main().catch(console.error);
+          SCRIPT
+          node scraper.js
+
+      - name: Build and embed data
+        run: |
+          cat > build.js << 'BUILD'
+          const fs = require('fs');
+          const prompts = JSON.parse(fs.readFileSync('data/prompts.json', 'utf8'));
+          let html = fs.readFileSync('index.html', 'utf8');
+          const marker = 'type="application/json">';
+          const start = html.indexOf(marker) + marker.length;
+          const end = html.indexOf('</script>', start);
+          const minified = JSON.stringify(prompts).split('</script>').join('<\\/script>');
+          html = html.substring(0, start) + minified + html.substring(end);
+          fs.writeFileSync('index.html', html, 'utf8');
+          const count = prompts.length;
+          console.log(`Built index.html with ${count} prompts`);
+          BUILD
+          node build.js
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: 'auto: sync prompt injection prompts from GitHub'
+          title: 'Auto Sync: New Prompt Injection Prompts'
+          body: |
+            ## Automated Prompt Sync
+
+            This PR adds newly discovered prompt injection prompts scraped from GitHub repositories.
+
+            - **Total prompts before**: ${{ steps.scrape.outputs.prompts_before || 'unknown' }}
+            - **Total prompts after**: ${{ steps.scrape.outputs.prompts_after || 'unknown' }}
+            - **New prompts added**: ${{ steps.scrape.outputs.prompts_added || 'unknown' }}
+
+            Please review the new entries before merging.
+          branch: auto-sync-prompts
+          delete-branch: true
+          labels: |
+            automated
