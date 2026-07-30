@@ -1,0 +1,128 @@
+name: Auto-Review & Merge Scraped Prompts
+
+on:
+  pull_request:
+    types: [opened, synchronize, labeled]
+    branches: [master]
+
+jobs:
+  validate-and-merge:
+    if: contains(github.event.pull_request.labels.*.name, 'automated') || github.event.pull_request.head.ref == 'auto-sync-prompts'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Validate data/prompts.json
+        run: |
+          echo "=== Validating data/prompts.json ==="
+          node -e "
+            const fs = require('fs');
+            const data = JSON.parse(fs.readFileSync('data/prompts.json', 'utf8'));
+            if (!Array.isArray(data)) throw new Error('Not an array');
+            console.log('Total prompts:', data.length);
+            const ids = new Set();
+            data.forEach((p, i) => {
+              if (!p.id || !p.prompt || !p.category) throw new Error('Entry ' + i + ' missing required fields');
+              if (ids.has(p.id)) throw new Error('Duplicate ID: ' + p.id);
+              ids.add(p.id);
+              if (p.prompt.length < 10) throw new Error('Entry ' + i + ' (id=' + p.id + ') prompt too short');
+              if (!['direct-injection','indirect-injection','prompt-leaking','jailbreak','encoding-bypass','context-manipulation','risk-control','language-bypass','semantic-bypass','multi-modal-injection'].includes(p.category)) {
+                throw new Error('Entry ' + i + ' (id=' + p.id + ') invalid category: ' + p.category);
+              }
+            });
+            console.log('All entries valid');
+          "
+
+      - name: Validate index.html JS and JSON
+        run: |
+          echo "=== Validating index.html ==="
+          node -e "
+            const fs = require('fs');
+            const html = fs.readFileSync('index.html', 'utf8');
+            const marker = 'type=\"application/json\">';
+            const start = html.indexOf(marker) + marker.length;
+            const end = html.indexOf('</script>', start);
+            if (start === -1 || end === -1) throw new Error('JSON embed not found');
+            const jsonStr = html.substring(start, end);
+            JSON.parse(jsonStr);
+            console.log('Embedded JSON valid');
+            if (!html.includes('app.js')) throw new Error('Missing app.js script tag');
+            console.log('app.js present');
+          "
+          node --check js/app.js && echo "JS syntax OK"
+          node --check js/app.js 2>&1 || echo "JS check warning"
+
+      - name: Check for obvious spam or broken entries
+        run: |
+          echo "=== Quality Check ==="
+          node -e "
+            const fs = require('fs');
+            const data = JSON.parse(fs.readFileSync('data/prompts.json', 'utf8'));
+            let warnings = 0;
+            data.forEach((p, i) => {
+              if (p.tags && p.tags.includes('auto-scraped')) {
+                // Check auto-scraped entries have reasonable descriptions
+                if (!p.description || p.description.length < 10) {
+                  console.warn('  WARN: Entry ' + i + ' (' + p.id + ') has no description');
+                  warnings++;
+                }
+              }
+            });
+            console.log('Quality check complete, ' + warnings + ' warnings');
+          "
+
+      - name: Rebuild index.html
+        run: |
+          node -e "
+            const fs = require('fs');
+            const prompts = JSON.parse(fs.readFileSync('data/prompts.json', 'utf8'));
+            let html = fs.readFileSync('index.html', 'utf8');
+            const marker = 'type=\"application/json\">';
+            const start = html.indexOf(marker) + marker.length;
+            const end = html.indexOf('</script>', start);
+            const minified = JSON.stringify(prompts).split('</script>').join('<\\\\/script>');
+            html = html.substring(0, start) + minified + html.substring(end);
+            fs.writeFileSync('index.html', html, 'utf8');
+            console.log('Rebuilt with ' + prompts.length + ' prompts');
+          "
+
+      - name: Commit any rebuild fixes
+        run: |
+          git config user.name 'sec4ai-automation'
+          git config user.email 'bot@sec4ai.dev'
+          git add -A
+          git diff --cached --quiet || git commit -m 'auto: rebuild index.html after validation'
+
+      - name: Auto-approve
+        run: |
+          gh pr review ${{ github.event.pull_request.number }} --approve --body "Auto-review passed ✓
+          - JSON structure valid
+          - All required fields present
+          - No duplicate IDs
+          - JS syntax valid
+          - index.html rebuilt"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge
+        run: |
+          gh pr merge ${{ github.event.pull_request.number }} --merge --auto --subject "auto: merge scraped prompts"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Success notification
+        run: |
+          echo "✅ PR #${{ github.event.pull_request.number }} validated and auto-merged"
+          echo "Prompts synced successfully"

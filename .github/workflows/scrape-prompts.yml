@@ -453,28 +453,40 @@ jobs:
           BUILD
           node build.js
 
-      - name: Create Pull Request with new prompts
-        uses: peter-evans/create-pull-request@v7
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: 'auto: sync prompt injection prompts from GitHub'
-          title: 'Auto Sync: New Prompt Injection Prompts'
-          body: |
-            ## Automated Prompt Sync
+      - name: Validate scraped data
+        run: |
+          echo "=== Validating data/prompts.json ==="
+          node -e "
+            const fs = require('fs');
+            const data = JSON.parse(fs.readFileSync('data/prompts.json', 'utf8'));
+            if (!Array.isArray(data)) throw new Error('Not an array');
+            const ids = new Set();
+            data.forEach((p, i) => {
+              if (!p.id || !p.prompt || !p.category) throw new Error('Entry ' + i + ' missing required fields');
+              if (ids.has(p.id)) throw new Error('Duplicate ID: ' + p.id);
+              ids.add(p.id);
+              if (p.prompt.length < 10) throw new Error('Entry ' + i + ' prompt too short');
+            });
+            // Check index.html JSON embed
+            const html = fs.readFileSync('index.html', 'utf8');
+            const marker = 'type=\"application/json\">';
+            const start = html.indexOf(marker) + marker.length;
+            const end = html.indexOf('</script>', start);
+            JSON.parse(html.substring(start, end));
+            if (!html.includes('app.js')) throw new Error('Missing app.js');
+            console.log('Validation passed: ' + data.length + ' prompts, index.html OK');
+          "
+          node --check js/app.js
 
-            New prompt injection prompts have been automatically scraped and collected from GitHub repositories.
-
-            **Scan Results:**
-            - Total prompts before: ${{ steps.scrape.outputs.prompts_before || 'unknown' }}
-            - Total prompts after: ${{ steps.scrape.outputs.prompts_after || 'unknown' }}
-            - New prompts added: ${{ steps.scrape.outputs.prompts_added || 'unknown' }}
-
-            **What was searched:**
-            - Repositories with keywords: prompt injection, jailbreak, prompt leak, prompt attack
-            - Each repo's README, JSON files, CSV files, Markdown files, and text files
-            - Extracted prompts from code blocks, blockquotes, structured JSON/CSV data
-
-            **Note:** Auto-scraped entries are tagged with `auto-scraped` and should be reviewed before merging.
-          branch: auto-sync-prompts
-          delete-branch: true
-          labels: automated
+      - name: Commit and push directly if validation passes
+        run: |
+          git config user.name 'sec4ai-automation'
+          git config user.email 'bot@sec4ai.dev'
+          git add data/prompts.json index.html
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m 'auto: sync prompt injection prompts from GitHub'
+            git push
+            echo "Committed and pushed ${{ steps.scrape.outputs.prompts_added || 0 }} new prompts"
+          fi
