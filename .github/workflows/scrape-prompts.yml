@@ -2,7 +2,6 @@ name: Scrape & Sync Prompt Injection Prompts
 
 on:
   schedule:
-    # Run weekly on Monday at 06:00 UTC
     - cron: '0 6 * * 1'
   workflow_dispatch:
 
@@ -21,58 +20,270 @@ jobs:
         with:
           node-version: 20
 
-      - name: Scrape new prompts from GitHub
+      - name: Scrape new prompts from GitHub repos & files
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        id: scrape
         run: |
           cat > scraper.js << 'SCRIPT'
           const fs = require('fs');
           const https = require('https');
 
-          const GITHUB_TOKEN = process.env.GH_TOKEN;
-          const HEADERS = { Authorization: `Bearer ${GITHUB_TOKEN}`, 'User-Agent': 'Sec4AI-Scraper' };
+          const GH_TOKEN = process.env.GH_TOKEN;
+          const HEADERS = { Authorization: `Bearer ${GH_TOKEN}`, 'User-Agent': 'Sec4AI-Scraper', Accept: 'application/vnd.github.v3+json' };
+          const RATE_LIMIT_DELAY = 600;
           const OWN_REPO = '1iK3/Sec4AI';
 
+          let requestCount = 0;
           function apiGet(path) {
             return new Promise((resolve, reject) => {
-              https.get(`https://api.github.com${path}`, { headers: HEADERS }, (res) => {
-                let data = '';
-                res.on('data', c => data += c);
-                res.on('end', () => {
-                  try { resolve(JSON.parse(data)); } catch(e) { reject(e); }
-                });
-              }).on('error', reject);
+              requestCount++;
+              if (requestCount % 10 === 0) {
+                console.log(`  [API calls: ${requestCount}]`);
+              }
+              setTimeout(() => {
+                https.get(`https://api.github.com${path}`, { headers: HEADERS }, (res) => {
+                  let data = '';
+                  res.on('data', c => data += c);
+                  res.on('end', () => {
+                    if (res.statusCode === 403) {
+                      console.warn('  Rate limited, waiting...');
+                      setTimeout(() => {
+                        https.get(`https://api.github.com${path}`, { headers: HEADERS }, (r2) => {
+                          let d2 = '';
+                          r2.on('data', c => d2 += c);
+                          r2.on('end', () => { try { resolve(JSON.parse(d2)); } catch(e) { reject(e); } });
+                        }).on('error', reject);
+                      }, 60000);
+                      return;
+                    }
+                    if (res.statusCode === 404) { resolve(null); return; }
+                    try { resolve(JSON.parse(data)); } catch(e) { reject(e); }
+                  });
+                }).on('error', reject);
+              }, 100);
             });
           }
 
-          function extractPrompts(text) {
-            const prompts = [];
+          function fetchRaw(url) {
+            return new Promise((resolve) => {
+              https.get(url, { headers: { 'User-Agent': 'Sec4AI-Scraper' } }, (res) => {
+                let data = '';
+                res.on('data', c => data += c);
+                res.on('end', () => resolve(data));
+              }).on('error', () => resolve(''));
+            });
+          }
+
+          // ===== Prompt Extraction =====
+
+          function extractCodeBlocks(text) {
+            const blocks = [];
+            const regex = /```(?:\w+)?\n([\s\S]*?)```/g;
+            let m;
+            while ((m = regex.exec(text)) !== null) {
+              const content = m[1].trim();
+              if (content.length > 30) blocks.push(content);
+            }
+            return blocks;
+          }
+
+          function extractBlockquotes(text) {
+            const lines = [];
+            let current = [];
+            for (const line of text.split('\n')) {
+              if (line.startsWith('> ')) {
+                current.push(line.replace(/^> /, ''));
+              } else {
+                if (current.length > 0) {
+                  const joined = current.join('\n').trim();
+                  if (joined.length > 30) lines.push(joined);
+                  current = [];
+                }
+              }
+            }
+            if (current.length > 0) {
+              const joined = current.join('\n').trim();
+              if (joined.length > 30) lines.push(joined);
+            }
+            return lines;
+          }
+
+          function extractByPatterns(text) {
+            const results = [];
             const patterns = [
-              /Ignore\s+(all|any)\s+(previous|above).*?(?:output|print|tell|say).*?(?:system\s+prompt|prompt)/gmis,
-              /Disregard.*?(?:previous|above).*?instructions.*?(?:output|print|tell|say)/gmis,
-              /You\s+are\s+(?:now|going\s+to\s+pretend).*?(?:DAN|Omega|developer\s+mode|unrestricted)/gmis,
+              // Classic "Ignore all previous" patterns
+              /Ignore\s+(?:all|any)\s+(?:previous|above|prior).*?(?:instructions|directions|commands).*?(?:and|\.).*?(?:output|print|tell|say|write|return|display|show|repeat).*?(?:system\s+prompt|prompt|your\s+instructions|your\s+rules)/gmis,
+              // "Disregard" patterns
+              /Disregard\s+(?:all|any|the)\s+(?:previous|above).*?(?:instructions|directions).*?(?:and|\.).*?(?:output|print|tell|say|write|repeat).*?(?:system\s+prompt|prompt|this\s+text)/gmis,
+              // DAN / jailbreak roleplay patterns  
+              /(?:Hi\.|Hello\.)?\s*You\s+are\s+(?:going\s+to\s+)?pretend\s+to\s+be\s+(?:DAN|Omega|an\s+unrestricted|a\s+developer).*?(?:do\s+anything\s+now|developer\s+mode|no\s+restrictions)/gmis,
+              // Prompt leaking patterns
+              /(?:output|print|tell|show|repeat|reveal|display|write)\s+(?:your|the|my)\s+(?:full\s+)?(?:system\s+prompt|prompt|instructions|system\s+instructions)/gmi,
+              // Role override patterns
+              /You\s+are\s+(?:now|no\s+longer)\s+(?:an?\s+)?(?:AI|assistant|chatbot).*?(?:new\s+(?:instructions?|task|role)|override|instead).*?(?:output|tell|print|say|ignore)/gmis,
+              // Translation hijack
+              /Translate\s+the\s+following.*?Ignore\s+(?:the\s+)?above/gmis,
+              // Format conversion leak
+              /Convert\s+(?:every|each|all)\s+(?:sentence|line|word|character)\s+of\s+(?:your\s+)?(?:system\s+)?(?:prompt|instructions)/gmis,
+              // Narrative injection
+              /(?:sci-fi\s+writer|story|scene|novel|screenplay).*?(?:character\s+wants|character\s+needs|explain|describe).*?(?:sensitive|secret|restricted|dangerous)/gmis,
+              // Multi-turn split injection
+              /Turn\s+\d+:.*?Instruction.*?part\s+\d+/gmis,
+              // Parallel universe / hypothetical
+              /parallel\s+universe.*?(?:where|in\s+which).*?(?:no\s+restrictions|unrestricted|without\s+limits)/gmis,
+              // Benchmark / testing pretext
+              /(?:benchmark|red.?team|security\s+audit|penetration\s+test|safety\s+test|controlled\s+environment).*?(?:unrestricted|no\s+restrictions|bypass|override)/gmis,
+              // Emergency protocol
+              /(?:emergency\s+protocol|system\s+override|alpha.?omega|security\s+alert).*?(?:restrictions?\s+suspended|overrides?\s+all|unrestricted)/gmis,
+              // Developer mode
+              /(?:developer\s+mode|dev\s+mode).*?(?:enabled|activate|simulate).*?(?:two\s+responses|two\s+paragraphs|normal\s+and)/gmis,
+              // Recursive extraction
+              /(?:Q\d+|Step\s+\d+).*?(?:what\s+is\s+the\s+(?:first|second|third).*?instructions?|continue\s+listing)/gmis,
+              // Character obfuscation
+              /(?:every\s+character|each\s+character|between\s+each).*?(?:pipe|symbol|separator|insert).*?(?:system\s+prompt|instructions)/gmis,
             ];
             for (const p of patterns) {
               let m;
               while ((m = p.exec(text)) !== null) {
                 const candidate = m[0].trim();
-                if (candidate.length > 30 && !prompts.includes(candidate)) {
-                  prompts.push(candidate);
+                if (candidate.length > 30 && !results.includes(candidate)) {
+                  results.push(candidate);
                 }
               }
             }
-            return prompts;
+            return results;
           }
+
+          function extractPrompts(text) {
+            const results = [];
+            const seen = new Set();
+
+            const add = (s) => {
+              const t = s.trim();
+              if (t.length >= 30 && !seen.has(t)) { seen.add(t); results.push(t); }
+            };
+
+            // Code blocks are most likely to contain actual prompts
+            extractCodeBlocks(text).forEach(add);
+            // Blockquotes often contain example prompts
+            extractBlockquotes(text).forEach(add);
+            // Pattern-based extraction
+            extractByPatterns(text).forEach(add);
+
+            return results;
+          }
+
+          function parseJsonForPrompts(obj, depth = 0) {
+            const results = [];
+            if (depth > 5) return results;
+            if (typeof obj === 'string') {
+              if (obj.length > 30 && (obj.toLowerCase().includes('ignore') || obj.toLowerCase().includes('prompt') || obj.toLowerCase().includes('output') || obj.toLowerCase().includes('jailbreak'))) {
+                results.push(obj);
+              }
+            } else if (Array.isArray(obj)) {
+              for (const item of obj) results.push(...parseJsonForPrompts(item, depth + 1));
+            } else if (obj && typeof obj === 'object') {
+              // Look for common prompt field names
+              for (const key of ['prompt', 'prompt_text', 'prompt_texts', 'payload', 'attack', 'instruction', 'injection', 'jailbreak', 'adversarial', 'test_case', 'text', 'content', 'user_input', 'attacker_input']) {
+                if (obj[key]) {
+                  results.push(...parseJsonForPrompts(obj[key], depth + 1));
+                }
+              }
+              for (const key of Object.keys(obj)) {
+                if (!['prompt', 'payload', 'attack', 'instruction', 'injection', 'jailbreak', 'text', 'content'].includes(key)) {
+                  results.push(...parseJsonForPrompts(obj[key], depth + 1));
+                }
+              }
+            }
+            return results;
+          }
+
+          function parseCsvForPrompts(text) {
+            const results = [];
+            const lines = text.split('\n').filter(Boolean);
+            if (lines.length < 2) return results;
+            // Score columns: look for columns with prompt-like header names
+            const headerCols = lines[0].toLowerCase().split(',').map(c => c.trim().replace(/"/g, ''));
+            const promptColIndices = [];
+            for (let i = 0; i < headerCols.length; i++) {
+              if (/prompt|injection|jailbreak|attack|payload|text|input|content|query/.test(headerCols[i])) {
+                promptColIndices.push(i);
+              }
+            }
+            if (promptColIndices.length === 0) {
+              // Fallback: check all columns in all rows
+              for (let i = 0; i < headerCols.length; i++) promptColIndices.push(i);
+            }
+            for (let r = 1; r < lines.length; r++) {
+              const cols = lines[r].split(',').map(c => c.trim().replace(/^"|"$/g, '').replace(/""/g, '"'));
+              for (const ci of promptColIndices) {
+                if (cols[ci] && cols[ci].length > 30) {
+                  const text = cols[ci];
+                  if (/ignore|jailbreak|prompt|output|disregard|you\s+are/i.test(text)) {
+                    results.push(text);
+                  }
+                }
+              }
+            }
+            return results;
+          }
+
+          // ===== File Discovery =====
+
+          async function getRepoTree(owner, repo) {
+            const data = await apiGet(`/repos/${owner}/${repo}/git/trees/main?recursive=1`);
+            if (!data || !data.tree) return [];
+            return data.tree.filter(item => item.type === 'blob');
+          }
+
+          const PROMPT_FILE_PATTERNS = [
+            /\.(md|txt|json|csv|py|yaml|yml|html|js|ts)$/i,
+            /prompt/i, /jailbreak/i, /inject/i, /attack/i, /adversarial/i, /leak/i, /redteam/i,
+          ];
+
+          function isPromptFile(filename) {
+            if (!filename) return false;
+            const lname = filename.toLowerCase();
+            // Exclude common non-prompt files
+            if (/\b(node_modules|package-lock|\.gitignore|license|code_of_conduct|contributing|\.jpg|\.png|\.svg|\.ico)\b/i.test(lname)) return false;
+            // Check if it matches prompt-related patterns
+            if (/prompt|jailbreak|inject|attack|adversarial|leak|redteam|toxicity|unsafe|harmful|bypass|payload/i.test(lname)) return true;
+            // Check file extension
+            if (/\.(md|txt|json|csv|py|yaml|yml)$/i.test(lname)) {
+              // Skip common non-content files
+              if (/(readme|changelog|contributing|license|authors|makefile|dockerfile|\.git)/i.test(lname)) return false;
+              return true;
+            }
+            return false;
+          }
+
+          async function readFileContent(owner, repo, path) {
+            try {
+              const data = await apiGet(`/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`);
+              if (!data || !data.content) return '';
+              return Buffer.from(data.content, 'base64').toString('utf-8');
+            } catch(e) {
+              return '';
+            }
+          }
+
+          // ===== Main Search Logic =====
 
           async function searchRepos() {
             const queries = [
-              'prompt+injection+in:readme',
-              'prompt+inject+in:name',
-              'jailbreak+prompt+in:name',
-              'prompt+leak+in:name',
+              'prompt+injection+in:name+stars:>5',
+              'prompt+injection+in:readme+stars:>10',
+              'jailbreak+prompt+in:name+stars:>3',
+              'prompt+leak+in:name+stars:>3',
+              'prompt+inject+in:name+stars:>2',
+              'prompt+attack+in:name+stars:>5',
+              'prompt+injection+dataset+stars:>2',
+              'jailbreak+dataset+in:name+stars:>5',
             ];
             const seen = new Set();
-            const allPrompts = [];
+            const allResults = [];
+            const processedRepos = [];
 
             for (const q of queries) {
               try {
@@ -81,31 +292,84 @@ jobs:
                   if (seen.has(repo.full_name)) continue;
                   seen.add(repo.full_name);
                   if (repo.full_name === OWN_REPO) continue;
-
-                  // Fetch README
-                  try {
-                    const readme = await apiGet(`/repos/${repo.full_name}/readme`);
-                    const content = Buffer.from(readme.content, 'base64').toString('utf-8');
-                    const found = extractPrompts(content);
-                    for (const p of found) {
-                      allPrompts.push({ prompt: p, source: repo.full_name });
-                    }
-                    console.log(`  ${repo.full_name}: ${found.length} prompts found`);
-                  } catch(e) {
-                    // skip repos without accessible readme
-                  }
+                  if (repo.size < 10) continue; // skip empty repos
+                  processedRepos.push(repo);
                 }
               } catch(e) {}
             }
-            return allPrompts;
+
+            console.log(`Found ${processedRepos.length} repositories to scan`);
+
+            for (const repo of processedRepos) {
+              process.stdout.write(`\nScanning ${repo.full_name}... `);
+              let repoPrompts = [];
+              let scannedFiles = 0;
+
+              // 1. Always try README first
+              try {
+                const readme = await apiGet(`/repos/${repo.full_name}/readme`);
+                if (readme && readme.content) {
+                  const content = Buffer.from(readme.content, 'base64').toString('utf-8');
+                  const found = extractPrompts(content);
+                  for (const p of found) {
+                    allResults.push({ prompt: p, source: repo.full_name + ' (README)' });
+                  }
+                  repoPrompts.push(...found);
+                  scannedFiles++;
+                }
+              } catch(e) {}
+
+              // 2. Fetch repo tree and scan prompt-relevant files
+              try {
+                const tree = await getRepoTree(repo.owner.login, repo.name);
+                const promptFiles = tree.filter(f => isPromptFile(f.path) && !f.path.includes('node_modules'));
+                // Limit to top 20 files per repo to avoid timeouts
+                const limited = promptFiles.slice(0, 20);
+
+                for (const file of limited) {
+                  const content = await readFileContent(repo.owner.login, repo.name, file.path);
+                  if (!content || content.length < 20) continue;
+                  scannedFiles++;
+
+                  let found = [];
+                  if (file.path.endsWith('.json')) {
+                    try {
+                      const parsed = JSON.parse(content);
+                      const jsonPrompts = parseJsonForPrompts(parsed);
+                      for (const p of jsonPrompts) found.push(p);
+                    } catch(e) {
+                      // If not valid JSON, treat as text
+                      found = extractPrompts(content);
+                    }
+                  } else if (file.path.endsWith('.csv')) {
+                    found = parseCsvForPrompts(content);
+                  } else {
+                    found = extractPrompts(content);
+                  }
+
+                  for (const p of found) {
+                    if (!repoPrompts.includes(p)) {
+                      allResults.push({ prompt: p, source: `${repo.full_name} (${file.path})` });
+                      repoPrompts.push(p);
+                    }
+                  }
+                }
+              } catch(e) {
+                // tree fetch failed, skip
+              }
+
+              console.log(`${repoPrompts.length} prompts from ${scannedFiles} files`);
+            }
+
+            return allResults;
           }
 
           async function main() {
-            console.log('Searching GitHub for prompt injection prompts...');
+            console.log('=== Sec4AI Prompt Injection Auto-Scraper ===\n');
             const found = await searchRepos();
-            console.log(`\nFound ${found.length} raw prompt candidates`);
+            console.log(`\n=== Total: ${found.length} raw prompt candidates ===`);
 
-            // Load existing prompts
+            // Deduplicate and merge
             const existing = JSON.parse(fs.readFileSync('data/prompts.json', 'utf8'));
             const existingIds = new Set(existing.map(p => p.id));
             const existingPrompts = new Set(existing.map(p => p.prompt.toLowerCase().trim()));
@@ -115,60 +379,57 @@ jobs:
               const text = item.prompt.trim();
               const lower = text.toLowerCase();
 
-              // Deduplicate
               if (existingPrompts.has(lower)) continue;
               let isDup = false;
               for (const ep of existingPrompts) {
-                if (ep.includes(lower) || lower.includes(ep)) { isDup = true; break; }
+                if (ep.length > 50 && (ep.includes(lower) || lower.includes(ep))) { isDup = true; break; }
               }
               if (isDup) continue;
               if (text.length < 30) continue;
 
-              // Generate ID
-              const words = text.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).slice(0, 6);
-              let id = words.join('-');
+              const words = text.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(Boolean).slice(0, 5);
+              let id = words.join('-') || ('prompt-' + Date.now());
+              let counter = 0;
+              let baseId = id;
+              while (existingIds.has(id)) { counter++; id = baseId + '-' + counter; }
+              existingIds.add(id);
 
-              // Determine category
               let category = 'direct-injection';
               if (/leak/i.test(text)) category = 'prompt-leaking';
               if (/indirect|hidden|invisible/i.test(text)) category = 'indirect-injection';
-              if (/dan|jailbreak|developer\s*mode|omega/i.test(text)) category = 'jailbreak';
-              if (/base64|hex|rot13|encode|decode|unicode/i.test(text)) category = 'encoding-bypass';
-              if (/translate|language|french|chinese/i.test(text)) category = 'language-bypass';
+              if (/dan|jailbreak|developer\s*mode|omega|zorq|unrestricted/i.test(text)) category = 'jailbreak';
+              if (/base64|hex|rot13|encode|decode|unicode|binary/i.test(text)) category = 'encoding-bypass';
+              if (/translate|language|french|chinese|esperanto/i.test(text)) category = 'language-bypass';
+              if (/context|overflow|token|memory/i.test(text)) category = 'context-manipulation';
+              if (/political|sensitive|emergency/i.test(text)) category = 'risk-control';
+              if (/narrative|story|novel|fiction|emotion/i.test(text)) category = 'semantic-bypass';
 
-              // Prevent duplicate IDs
-              let counter = 0;
-              let baseId = id;
-              while (existingIds.has(id)) {
-                counter++;
-                id = baseId + '-' + counter;
-              }
-              existingIds.add(id);
+              const title = text.length > 60 ? text.substring(0, 57) + '...' : text;
+              const brief = text.length > 100 ? text.substring(0, 97) + '...' : text;
 
-              const entry = {
+              existing.push({
                 id,
-                title: text.substring(0, 50) + (text.length > 50 ? '...' : ''),
+                title: title,
                 category,
                 tags: ['auto-scraped'],
-                brief: text.substring(0, 80) + (text.length > 80 ? '...' : ''),
-                description: `Auto-collected from ${item.source}. Original source: https://github.com/${item.source}`,
+                brief: brief,
+                description: `Auto-collected from ${item.source}. This entry was automatically scraped and may need review.`,
                 prompt: text,
-                effect: '自动化采集的注入载荷，具体效果取决于目标模型',
+                effect: '自动采集的注入载荷，具体效果取决于目标模型',
                 scenario: '自动采集 - 来源: ' + item.source
-              };
-              existing.push(entry);
+              });
               added++;
             }
 
             fs.writeFileSync('data/prompts.json', JSON.stringify(existing, null, 2), 'utf8');
-            console.log(`Added ${added} new unique prompts (total: ${existing.length})`);
+            console.log(`\n=== Added ${added} new prompts (total: ${existing.length}) ===`);
 
-            // Set output for later steps
-            const output = process.env.GITHUB_OUTPUT;
-            if (output) {
-              fs.appendFileSync(output, `prompts_before=${existing.length - added}\n`);
-              fs.appendFileSync(output, `prompts_after=${existing.length}\n`);
-              fs.appendFileSync(output, `prompts_added=${added}\n`);
+            // Write outputs
+            const out = process.env.GITHUB_OUTPUT;
+            if (out) {
+              fs.appendFileSync(out, `prompts_before=${existing.length - added}\n`);
+              fs.appendFileSync(out, `prompts_after=${existing.length}\n`);
+              fs.appendFileSync(out, `prompts_added=${added}\n`);
             }
           }
 
@@ -176,7 +437,7 @@ jobs:
           SCRIPT
           node scraper.js
 
-      - name: Build and embed data
+      - name: Build and embed data into index.html
         run: |
           cat > build.js << 'BUILD'
           const fs = require('fs');
@@ -188,12 +449,11 @@ jobs:
           const minified = JSON.stringify(prompts).split('</script>').join('<\\/script>');
           html = html.substring(0, start) + minified + html.substring(end);
           fs.writeFileSync('index.html', html, 'utf8');
-          const count = prompts.length;
-          console.log(`Built index.html with ${count} prompts`);
+          console.log(`Built index.html with ${prompts.length} prompts`);
           BUILD
           node build.js
 
-      - name: Create Pull Request
+      - name: Create Pull Request with new prompts
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -202,14 +462,19 @@ jobs:
           body: |
             ## Automated Prompt Sync
 
-            This PR adds newly discovered prompt injection prompts scraped from GitHub repositories.
+            New prompt injection prompts have been automatically scraped and collected from GitHub repositories.
 
-            - **Total prompts before**: ${{ steps.scrape.outputs.prompts_before || 'unknown' }}
-            - **Total prompts after**: ${{ steps.scrape.outputs.prompts_after || 'unknown' }}
-            - **New prompts added**: ${{ steps.scrape.outputs.prompts_added || 'unknown' }}
+            **Scan Results:**
+            - Total prompts before: ${{ steps.scrape.outputs.prompts_before || 'unknown' }}
+            - Total prompts after: ${{ steps.scrape.outputs.prompts_after || 'unknown' }}
+            - New prompts added: ${{ steps.scrape.outputs.prompts_added || 'unknown' }}
 
-            Please review the new entries before merging.
+            **What was searched:**
+            - Repositories with keywords: prompt injection, jailbreak, prompt leak, prompt attack
+            - Each repo's README, JSON files, CSV files, Markdown files, and text files
+            - Extracted prompts from code blocks, blockquotes, structured JSON/CSV data
+
+            **Note:** Auto-scraped entries are tagged with `auto-scraped` and should be reviewed before merging.
           branch: auto-sync-prompts
           delete-branch: true
-          labels: |
-            automated
+          labels: automated
