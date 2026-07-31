@@ -1,1 +1,5 @@
 node_modules/
+gen-part1/
+gen-part2/
+tools/gen-converted.json
+tools/gen-composite.json
