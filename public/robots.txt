@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+Disallow: /raw/
+
+Sitemap: https://sec4ai.vercel.app/sitemap.xml

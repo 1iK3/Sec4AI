@@ -7,16 +7,22 @@ const d = JSON.parse(h.substring(s, e));
 const ids = new Set(d.map(p => p.id));
 
 let failures = [];
-d.forEach(p => {
-  // URL-safe check
-  if (!/^[a-z0-9-]+$/.test(p.id)) failures.push('invalid-chars: ' + p.id);
-  // Pathname extraction round-trip
-  const path = '/prompt/' + p.id;
-  const extracted = path.replace('/prompt/', '').replace(/\/$/, '').split('?')[0].split('#')[0];
-  if (!ids.has(extracted)) failures.push('not-found: ' + p.id);
+d.forEach((p, idx) => {
+  // New format: /prompt/<seq>-<id>
+  const seq = idx + 1;
+  const path = '/prompt/' + seq + '-' + p.id;
+  const seg = path.replace('/prompt/', '');
+  const m = seg.match(/^(\d+)-(.+)$/);
+  if (!m) { failures.push('no-match: ' + p.id); return; }
+  const parsedSeq = parseInt(m[1], 10);
+  const parsedId = m[2];
+  if (parsedId !== p.id) failures.push('id-mismatch: ' + p.id);
+  if (parsedSeq !== seq) failures.push('seq-mismatch: ' + p.id);
+  if (!ids.has(parsedId)) failures.push('not-found: ' + p.id);
+  if (!/^[a-z0-9-]+$/.test(p.id)) failures.push('invalid-id: ' + p.id);
 });
 
 console.log('Total prompts:', d.length);
 console.log('Routing failures:', failures.length);
 failures.slice(0, 15).forEach(f => console.log('  ', f));
-if (failures.length === 0) console.log('All cards will open correctly.');
+if (failures.length === 0) console.log('All prev/next navigation URLs resolve correctly.');
